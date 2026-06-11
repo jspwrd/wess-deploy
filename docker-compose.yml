@@ -84,6 +84,8 @@ services:
       # Same absolute path inside and out, so compose-resolved bind paths
       # (./nginx, ./postgres) stay valid when invoked from this container.
       - /opt/wess:/opt/wess:ro
+      # ghcr.io credentials so in-container `compose pull` can authenticate
+      - /home/jsprd/.docker/config.json:/root/.docker/config.json:ro
     networks:
       - wess-network
     security_opt:
