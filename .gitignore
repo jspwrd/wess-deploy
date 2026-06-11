@@ -1,0 +1,4 @@
+.env
+nginx/ssl/
+*.log
+*.bak
