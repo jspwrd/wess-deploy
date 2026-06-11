@@ -1,6 +1,11 @@
 #!/bin/bash
-# Cron job to sync TLE data daily
-# Add to crontab: 0 4 * * * /home/jsprd/dev/projects/repos/wess-deploy/scripts/sync-tles.sh >> /var/log/auto-tle-sync.log 2>&1
+# Daily TLE data sync (cron: 0 4 * * *). Pulls the latest AutoTLE image
+# if the registry is reachable, then runs the one-shot sync.
+set -euo pipefail
 
-cd /home/jsprd/dev/projects/repos/wess-deploy
-sudo docker compose run --rm auto-tle
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+COMPOSE_FILE="$(dirname "$SCRIPT_DIR")/docker-compose.yml"
+
+docker compose -f "$COMPOSE_FILE" pull auto-tle 2>/dev/null \
+    || echo "[sync-tles] pull failed; using local image"
+docker compose -f "$COMPOSE_FILE" run --rm auto-tle

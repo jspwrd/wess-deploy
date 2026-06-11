@@ -1,6 +1,8 @@
 FROM python:3.12-alpine
 
-RUN apk add --no-cache bash git docker-cli docker-cli-compose curl
+# bash + docker cli for deploy.sh, curl for notifications.
+# No git: deploys pull prebuilt images, never source.
+RUN apk add --no-cache bash docker-cli docker-cli-compose curl
 
 WORKDIR /app
 COPY server.py .

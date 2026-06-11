@@ -4,7 +4,8 @@
 set -euo pipefail
 
 BACKUP_DIR="/var/backups/wess-postgres"
-COMPOSE_DIR="/home/jsprd/dev/projects/repos/wess-deploy"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+COMPOSE_DIR="$(dirname "$SCRIPT_DIR")"
 LOG_PREFIX="[db-backup]"
 DATE=$(date '+%Y-%m-%d')
 DAY_OF_WEEK=$(date '+%u')  # 1=Monday, 7=Sunday
@@ -18,7 +19,7 @@ mkdir -p "$BACKUP_DIR/daily" "$BACKUP_DIR/weekly"
 DAILY_FILE="$BACKUP_DIR/daily/wess-${DATE}.sql.gz"
 log "Starting daily backup..."
 
-sudo docker compose -f "$COMPOSE_DIR/docker-compose.yml" exec -T postgres \
+docker compose -f "$COMPOSE_DIR/docker-compose.yml" exec -T postgres \
     pg_dump -U wess -d wess --clean --if-exists | gzip > "$DAILY_FILE"
 
 if [ -s "$DAILY_FILE" ]; then

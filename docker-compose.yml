@@ -1,3 +1,7 @@
+# Pin the project name so container names (wess-deploy-*-1) and the
+# postgres volume stay stable no matter where this directory lives.
+name: wess-deploy
+
 services:
   postgres:
     image: postgres:16-alpine
@@ -23,9 +27,8 @@ services:
       - /run
 
   wess-backend:
-    build:
-      context: ../wess-backend
-      dockerfile: Dockerfile
+    # Built and pushed by wess-backend's Deploy workflow (CI-gated).
+    image: ghcr.io/jspwrd/wess-backend:main
     restart: unless-stopped
     environment:
       DATABASE_URL: postgres://wess:${POSTGRES_PASSWORD:-wess_secret_2024}@postgres:5432/wess?sslmode=disable
@@ -48,9 +51,8 @@ services:
       - NET_BIND_SERVICE
 
   wess-frontend:
-    build:
-      context: ../wess
-      dockerfile: Dockerfile
+    # Built and pushed by wess's Deploy workflow (CI-gated).
+    image: ghcr.io/jspwrd/wess:main
     restart: unless-stopped
     environment:
       NODE_ENV: production
@@ -76,18 +78,25 @@ services:
     restart: unless-stopped
     environment:
       WEBHOOK_SECRET: ${WEBHOOK_SECRET:-}
+      DEPLOY_SCRIPT: /opt/wess/scripts/deploy.sh
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - /home/jsprd/dev/projects/repos:/repos
+      # Same absolute path inside and out, so compose-resolved bind paths
+      # (./nginx, ./postgres) stay valid when invoked from this container.
+      - /opt/wess:/opt/wess:ro
     networks:
       - wess-network
     security_opt:
       - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
 
   auto-tle:
-    build:
-      context: ../AutoTLE
-      dockerfile: Dockerfile
+    # Built and pushed by AutoTLE's CI workflow. One-shot sync job:
+    # run via deploy.sh, the daily sync-tles.sh cron, or
+    # `docker compose run --rm auto-tle`.
+    image: ghcr.io/jspwrd/autotle:latest
     restart: "no"
     environment:
       DATABASE_URL: postgres://wess:${POSTGRES_PASSWORD:-wess_secret_2024}@postgres:5432/wess?sslmode=disable
@@ -141,6 +150,9 @@ services:
 
 volumes:
   postgres_data:
+    # Explicit name: this volume holds the database; never let a project
+    # rename orphan it.
+    name: wess-deploy_postgres_data
 
 networks:
   wess-network:

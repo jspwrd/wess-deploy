@@ -3,7 +3,8 @@
 # Usage: ./restore-db.sh /var/backups/wess-postgres/daily/wess-2026-03-12.sql.gz
 set -euo pipefail
 
-COMPOSE_DIR="/home/jsprd/dev/projects/repos/wess-deploy"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+COMPOSE_DIR="$(dirname "$SCRIPT_DIR")"
 LOG_PREFIX="[db-restore]"
 
 log() { echo "$LOG_PREFIX $(date '+%Y-%m-%d %H:%M:%S') $*"; }
@@ -33,10 +34,10 @@ if [ "$CONFIRM" != "yes" ]; then
 fi
 
 log "Restoring from: $BACKUP_FILE"
-gunzip -c "$BACKUP_FILE" | sudo docker compose -f "$COMPOSE_DIR/docker-compose.yml" exec -T postgres \
+gunzip -c "$BACKUP_FILE" | docker compose -f "$COMPOSE_DIR/docker-compose.yml" exec -T postgres \
     psql -U wess -d wess
 
 log "Restore complete. Restarting backend to reconnect..."
-sudo docker compose -f "$COMPOSE_DIR/docker-compose.yml" restart wess-backend
+docker compose -f "$COMPOSE_DIR/docker-compose.yml" restart wess-backend
 
 log "Done!"

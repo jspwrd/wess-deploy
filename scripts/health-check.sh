@@ -4,12 +4,16 @@
 # Sends notifications via email (Fastmail SMTP) and ntfy.sh on failure/recovery
 set -uo pipefail
 
-COMPOSE_DIR="/home/jsprd/dev/projects/repos/wess-deploy"
-STATUS_FILE="/var/log/wess-health-status"
-PREV_STATUS_FILE="/var/log/wess-health-prev"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+COMPOSE_DIR="$(dirname "$SCRIPT_DIR")"
+STATE_DIR="/var/log/wess"
+STATUS_FILE="$STATE_DIR/health-status"
+PREV_STATUS_FILE="$STATE_DIR/health-prev"
 LOG_PREFIX="[health-check]"
 FAILURES=0
 DETAILS=""
+
+mkdir -p "$STATE_DIR" 2>/dev/null || true
 
 # Load notification config from .env
 if [ -f "$COMPOSE_DIR/.env" ]; then
@@ -17,75 +21,9 @@ if [ -f "$COMPOSE_DIR/.env" ]; then
     source "$COMPOSE_DIR/.env"
     set +a
 fi
+source "$SCRIPT_DIR/lib/notify.sh"
 
 log() { echo "$LOG_PREFIX $(date '+%Y-%m-%d %H:%M:%S') $*"; }
-
-# --- Notification functions ---
-send_ntfy() {
-    local title="$1"
-    local message="$2"
-    local priority="${3:-high}"
-    local tags="${4:-warning}"
-
-    if [ -n "${NTFY_TOPIC:-}" ]; then
-        curl -sf -o /dev/null \
-            -H "Title: $title" \
-            -H "Priority: $priority" \
-            -H "Tags: $tags" \
-            -d "$message" \
-            "https://ntfy.sh/$NTFY_TOPIC" 2>/dev/null || log "WARNING: ntfy notification failed"
-    fi
-}
-
-send_email() {
-    local subject="$1"
-    local body="$2"
-
-    if [ -n "${SMTP_HOST:-}" ] && [ -n "${SMTP_USER:-}" ] && [ -n "${SMTP_PASS:-}" ]; then
-        local recipients="${ALERT_EMAILS:-$SMTP_USER}"
-        local rcpt_args=""
-        local to_header=""
-
-        # Build --mail-rcpt flags and To: header for each recipient
-        IFS=',' read -ra ADDRS <<< "$recipients"
-        for addr in "${ADDRS[@]}"; do
-            addr=$(echo "$addr" | xargs)  # trim whitespace
-            rcpt_args="$rcpt_args --mail-rcpt $addr"
-            [ -n "$to_header" ] && to_header="$to_header, "
-            to_header="$to_header$addr"
-        done
-
-        local from_addr="${SMTP_FROM:-$SMTP_USER}"
-
-        curl -sf -o /dev/null \
-            --url "smtp://${SMTP_HOST}:${SMTP_PORT:-587}" \
-            --ssl-reqd \
-            --mail-from "$from_addr" \
-            $rcpt_args \
-            --user "$SMTP_USER:$SMTP_PASS" \
-            -T - <<EMAIL 2>/dev/null || log "WARNING: email notification failed"
-From: WESS Monitor <$from_addr>
-To: $to_header
-Subject: $subject
-Content-Type: text/plain; charset=utf-8
-
-$body
-
---
-WESS Health Monitor | $(hostname) ($(curl -sf --max-time 3 ifconfig.me 2>/dev/null || echo "unknown"))
-EMAIL
-    fi
-}
-
-notify() {
-    local title="$1"
-    local message="$2"
-    local priority="${3:-high}"
-    local tags="${4:-warning}"
-
-    send_ntfy "$title" "$message" "$priority" "$tags"
-    send_email "[WESS] $title" "$message"
-}
 
 # --- Check functions ---
 check_service() {
@@ -109,7 +47,7 @@ check_service() {
 check_container() {
     local name="$1"
     local status
-    status=$(sudo docker inspect --format='{{.State.Status}}' "$name" 2>/dev/null || echo "not_found")
+    status=$(docker inspect --format='{{.State.Status}}' "$name" 2>/dev/null || echo "not_found")
 
     if [ "$status" = "running" ]; then
         DETAILS="$DETAILS  ✓ $name container ($status)\n"
@@ -135,6 +73,7 @@ check_service "Backend Health" "http://localhost:80/health"
 check_service "Backend DB Health" "http://localhost:80/health/db"
 check_service "Frontend" "http://localhost:80/" 200
 check_service "API" "http://localhost:80/api/v1/tles-complete?limit=1"
+check_service "Webhook listener" "http://localhost:80/webhook"
 
 # Check disk space (alert if >85% used)
 DISK_USAGE=$(df / | tail -1 | awk '{print $5}' | tr -d '%')
@@ -146,11 +85,22 @@ else
 fi
 
 # Check database connectivity
-if sudo docker compose -f "$COMPOSE_DIR/docker-compose.yml" exec -T postgres pg_isready -U wess -d wess >/dev/null 2>&1; then
+if docker compose -f "$COMPOSE_DIR/docker-compose.yml" exec -T postgres pg_isready -U wess -d wess >/dev/null 2>&1; then
     DETAILS="$DETAILS  ✓ PostgreSQL accepting connections\n"
 else
     DETAILS="$DETAILS  ✗ PostgreSQL not responding\n"
     FAILURES=$((FAILURES + 1))
+fi
+
+# Check TLE data freshness (alert if no update in 48h; sync runs daily)
+TLE_AGE_HOURS=$(docker compose -f "$COMPOSE_DIR/docker-compose.yml" exec -T postgres \
+    psql -U wess -d wess -tAc \
+    "SELECT COALESCE(EXTRACT(EPOCH FROM (now() - max(updated_at)))/3600, 9999)::int FROM tles;" 2>/dev/null || echo "9999")
+if [ "$TLE_AGE_HOURS" -gt 48 ]; then
+    DETAILS="$DETAILS  ✗ TLE data stale: last update ${TLE_AGE_HOURS}h ago (threshold: 48h)\n"
+    FAILURES=$((FAILURES + 1))
+else
+    DETAILS="$DETAILS  ✓ TLE data fresh (${TLE_AGE_HOURS}h old)\n"
 fi
 
 # --- Determine status and handle notifications ---
@@ -201,10 +151,10 @@ Host: $(hostname)" \
 
     # Auto-recovery: try to restart failed containers
     for container in wess-deploy-nginx-1 wess-deploy-wess-frontend-1 wess-deploy-wess-backend-1 wess-deploy-postgres-1 wess-deploy-webhook-1; do
-        CSTATUS=$(sudo docker inspect --format='{{.State.Status}}' "$container" 2>/dev/null || echo "not_found")
+        CSTATUS=$(docker inspect --format='{{.State.Status}}' "$container" 2>/dev/null || echo "not_found")
         if [ "$CSTATUS" != "running" ] && [ "$CSTATUS" != "not_found" ]; then
             log "Attempting to restart $container..."
-            sudo docker start "$container" 2>/dev/null || true
+            docker start "$container" 2>/dev/null || true
         fi
     done
 fi

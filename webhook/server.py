@@ -1,4 +1,10 @@
-"""Minimal GitHub webhook listener that triggers deployments on push to main."""
+"""GitHub webhook listener that deploys when a CI/Deploy workflow succeeds.
+
+Listens for `workflow_run` events (Settings -> Webhooks -> "Workflow runs")
+and triggers deploy.sh only when the image-publishing workflow for a known
+repo completes successfully on main. Push events are acknowledged but
+ignored, so a push that fails CI never reaches production.
+"""
 
 import hashlib
 import hmac
@@ -9,13 +15,18 @@ import sys
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
-DEPLOY_SCRIPT = "/repos/wess-deploy/scripts/deploy.sh"
+DEPLOY_SCRIPT = os.environ.get("DEPLOY_SCRIPT", "/opt/wess/scripts/deploy.sh")
 PORT = 9000
+
+# repo -> name of the workflow whose success means "a fresh image is in ghcr"
+DEPLOYABLE = {
+    "wess": "Deploy",
+    "wess-backend": "Deploy",
+    "AutoTLE": "CI",  # AutoTLE's CI workflow contains its docker-publish job
+}
 
 
 def verify_signature(payload: bytes, signature: str) -> bool:
-    if not WEBHOOK_SECRET:
-        return True  # No secret configured, accept all
     expected = "sha256=" + hmac.new(
         WEBHOOK_SECRET.encode(), payload, hashlib.sha256
     ).hexdigest()
@@ -23,6 +34,12 @@ def verify_signature(payload: bytes, signature: str) -> bool:
 
 
 class WebhookHandler(BaseHTTPRequestHandler):
+    def _respond(self, code: int, body: dict) -> None:
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps(body).encode())
+
     def do_POST(self):
         if self.path != "/webhook":
             self.send_error(404)
@@ -31,28 +48,27 @@ class WebhookHandler(BaseHTTPRequestHandler):
         content_length = int(self.headers.get("Content-Length", 0))
         payload = self.rfile.read(content_length)
 
-        # Verify GitHub signature
         signature = self.headers.get("X-Hub-Signature-256", "")
-        if WEBHOOK_SECRET and not verify_signature(payload, signature):
+        if not verify_signature(payload, signature):
             print("[webhook] Invalid signature, rejecting", flush=True)
             self.send_error(403, "Invalid signature")
             return
 
-        # Parse event
         event = self.headers.get("X-GitHub-Event", "")
+
         if event == "ping":
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(b'{"status":"pong"}')
             print("[webhook] Received ping event", flush=True)
+            self._respond(200, {"status": "pong"})
             return
 
-        if event != "push":
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(b'{"status":"ignored","reason":"not a push event"}')
+        if event == "push":
+            # Deploys are gated on CI now; the push itself does nothing.
+            self._respond(200, {"status": "ignored",
+                                "reason": "deploys trigger on workflow_run success"})
+            return
+
+        if event != "workflow_run":
+            self._respond(200, {"status": "ignored", "reason": f"event {event}"})
             return
 
         try:
@@ -61,28 +77,32 @@ class WebhookHandler(BaseHTTPRequestHandler):
             self.send_error(400, "Invalid JSON")
             return
 
-        ref = data.get("ref", "")
-        repo = data.get("repository", {}).get("name", "unknown")
+        repo = data.get("repository", {}).get("name", "")
+        run = data.get("workflow_run", {}) or {}
+        action = data.get("action", "")
+        name = run.get("name", "")
+        branch = run.get("head_branch", "")
+        conclusion = run.get("conclusion", "")
+        sha = (run.get("head_sha") or "")[:7]
 
-        # Only deploy on push to main
-        if ref != "refs/heads/main":
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            msg = f'{{"status":"ignored","reason":"push to {ref}, not main"}}'
-            self.wfile.write(msg.encode())
-            print(f"[webhook] Ignoring push to {ref} on {repo}", flush=True)
+        expected_workflow = DEPLOYABLE.get(repo)
+        if expected_workflow is None:
+            self._respond(200, {"status": "ignored", "reason": f"unknown repo {repo}"})
+            return
+        if action != "completed" or name != expected_workflow or branch != "main":
+            self._respond(200, {"status": "ignored",
+                                "reason": f"{repo}/{name} action={action} branch={branch}"})
+            return
+        if conclusion != "success":
+            print(f"[webhook] {repo} {name} on main concluded '{conclusion}' "
+                  f"({sha}) — not deploying", flush=True)
+            self._respond(200, {"status": "ignored", "reason": f"conclusion {conclusion}"})
             return
 
-        print(f"[webhook] Push to main on {repo}, triggering deploy...", flush=True)
+        print(f"[webhook] {repo} {name} succeeded on main ({sha}), deploying...",
+              flush=True)
+        self._respond(202, {"status": "deploying", "repo": repo, "sha": sha})
 
-        # Respond immediately, deploy in background
-        self.send_response(202)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(b'{"status":"deploying"}')
-
-        # Trigger deploy with repo name so only the relevant service is rebuilt
         try:
             subprocess.Popen(
                 ["bash", DEPLOY_SCRIPT, repo],
@@ -94,10 +114,8 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/webhook":
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(b'{"status":"webhook listener running"}')
+            self._respond(200, {"status": "webhook listener running",
+                                "deploys": list(DEPLOYABLE)})
             return
         self.send_error(404)
 
@@ -106,10 +124,11 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    if not WEBHOOK_SECRET:
+        print("[webhook] FATAL: WEBHOOK_SECRET is not set; refusing to start "
+              "(signature verification is mandatory)", flush=True)
+        sys.exit(1)
     print(f"[webhook] Starting webhook listener on port {PORT}", flush=True)
-    if WEBHOOK_SECRET:
-        print("[webhook] Signature verification enabled", flush=True)
-    else:
-        print("[webhook] WARNING: No WEBHOOK_SECRET set, accepting all requests", flush=True)
+    print(f"[webhook] Deploy script: {DEPLOY_SCRIPT}", flush=True)
     server = HTTPServer(("0.0.0.0", PORT), WebhookHandler)
     server.serve_forever()
