@@ -39,16 +39,24 @@ send_email() {
 
         local from_addr="${SMTP_FROM:-$SMTP_USER}"
 
-        curl -sf -o /dev/null \
+        # RFC 2047-encode the subject: titles contain emoji, and raw 8-bit
+        # in headers gets the whole message rejected (8BITMIME only covers
+        # the body).
+        local subject_enc
+        subject_enc="=?UTF-8?B?$(printf '%s' "$subject" | base64 | tr -d '\n')?="
+
+        local curl_err
+        if ! curl_err=$(curl -sS -o /dev/null \
             --url "smtp://${SMTP_HOST}:${SMTP_PORT:-587}" \
             --ssl-reqd \
             --mail-from "$from_addr" \
             $rcpt_args \
             --user "$SMTP_USER:$SMTP_PASS" \
-            -T - <<EMAIL 2>/dev/null || echo "[notify] WARNING: email notification failed"
+            -T - 2>&1 <<EMAIL
 From: WESS Monitor <$from_addr>
 To: $to_header
-Subject: $subject
+Subject: $subject_enc
+MIME-Version: 1.0
 Content-Type: text/plain; charset=utf-8
 
 $body
@@ -56,6 +64,9 @@ $body
 --
 WESS Monitor | $(hostname)
 EMAIL
+        ); then
+            echo "[notify] WARNING: email notification failed: ${curl_err:-unknown error}"
+        fi
     fi
 }
 
