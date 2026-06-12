@@ -10,6 +10,7 @@ import hashlib
 import hmac
 import json
 import os
+import signal
 import subprocess
 import sys
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -128,6 +129,9 @@ if __name__ == "__main__":
         print("[webhook] FATAL: WEBHOOK_SECRET is not set; refusing to start "
               "(signature verification is mandatory)", flush=True)
         sys.exit(1)
+    # Auto-reap deploy children (we never inspect their exit status; without
+    # this, each fire-and-forget Popen leaves a zombie under PID 1).
+    signal.signal(signal.SIGCHLD, signal.SIG_IGN)
     print(f"[webhook] Starting webhook listener on port {PORT}", flush=True)
     print(f"[webhook] Deploy script: {DEPLOY_SCRIPT}", flush=True)
     server = HTTPServer(("0.0.0.0", PORT), WebhookHandler)
